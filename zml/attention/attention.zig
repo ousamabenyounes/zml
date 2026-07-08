@@ -6,8 +6,6 @@ const flashattn = @import("flashattn.zig");
 const metal = @import("metal_attention.zig");
 const nki = @import("nki/attention.zig");
 
-const Attention = @This();
-
 pub const Backend = enum {
     vanilla,
     attnd,
@@ -33,6 +31,22 @@ pub const Backend = enum {
             .neuron => .nki,
             .metal => .metal_fa,
             .cpu, .rocm, .tpu, .oneapi => .vanilla,
+        };
+    }
+
+    pub fn isAvailable(backend: Backend, platform: *const zml.Platform) bool {
+        return switch (backend) {
+            .vanilla => true,
+            .attnd => true, // attnd runs over network
+            .nki => platform.target == .neuron,
+            .metal_fa => platform.target == .metal,
+            .cuda_fa2 => platform.target == .cuda,
+            .cuda_fa3 => {
+                if (platform.target != .cuda) return false;
+                const first_device = platform.pjrt_client.devices(platform.pjrt_api)[0];
+                const cc = zml.platform.cuda.tryGetComputeCapabilities(platform, first_device) orelse return false;
+                return std.mem.eql(u8, cc, "9.0");
+            },
         };
     }
 };
@@ -157,7 +171,7 @@ pub fn attention(q: zml.Tensor, k: zml.Tensor, v: zml.Tensor, token_index: zml.T
             // Note: in Pytorch it would be very inefficient to generate the full attn_mask,
             // then slice into it, but XLA is able to optimize this correctly.
             attn_mask = attn_mask.gatherSlices(zml.Shape.init(.{ .q = q.dim(.q) }, attn_mask.dtype()), token_index.reshape(.{ .coord = 1 }), .{});
-            const attn_output = zml.nn.sdpa(q, k, v, .{ .attn_mask = attn_mask, .allow_cudnn = true });
+            const attn_output = zml.nn.sdpa(q, k, v, .{ .attn_mask = attn_mask });
             break :b attn_output;
         },
         .attnd => attnd.causalAttention(q, k, v, token_index, metadata.attnd, parameters.attnd),
@@ -166,4 +180,65 @@ pub fn attention(q: zml.Tensor, k: zml.Tensor, v: zml.Tensor, token_index: zml.T
         .cuda_fa3 => flashattn.fa3.attention(q, k, v, token_index, metadata.cuda_fa3, parameters.cuda_fa3),
         .metal_fa => metal.attention(q, k, v, token_index, metadata.metal_fa),
     };
+}
+
+test attention {
+    const platform = zml.testing.env();
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tensors: struct { q: zml.Tensor, k: zml.Tensor, v: zml.Tensor, token_index: zml.Tensor } = .{
+        .q = .init(.{ .b = 8, .h = 8, .q = 8, .hd = 32 }, .f32),
+        .k = .init(.{ .b = 8, .h = 2, .k = 64, .hd = 32 }, .f32),
+        .v = .init(.{ .b = 8, .h = 2, .k = 64, .hd = 32 }, .f32),
+        .token_index = .init(.{}, .u32),
+    };
+
+    const rng_q = try platform.compileFn(allocator, io, zml.Tensor.Rng.normal, .{ tensors.q.shape(), .{ .mean = 0, .stddev = 1 } }, .{});
+    defer rng_q.deinit();
+    const rng_k = try platform.compileFn(allocator, io, zml.Tensor.Rng.normal, .{ tensors.k.shape(), .{ .mean = 0, .stddev = 1 } }, .{});
+    defer rng_k.deinit();
+
+    const q = try zml.testing.autoCall(allocator, io, &rng_q, zml.Tensor.Rng.normal, {});
+    const k = try zml.testing.autoCall(allocator, io, &rng_k, zml.Tensor.Rng.normal, {});
+    const v = try zml.testing.autoCall(allocator, io, &rng_k, zml.Tensor.Rng.normal, {});
+    const token_index = try zml.Buffer.scalar(io, platform, 64, .u32);
+
+    const vanilla_exe = try platform.compileFn(allocator, io, attention, .{ tensors.q, tensors.k, tensors.v, tensors.token_index, .vanilla, .vanilla }, .{ .program_name = "attention_vanilla" });
+    defer vanilla_exe.deinit();
+
+    const vanilla_d = try zml.testing.autoCall(allocator, io, &vanilla_exe, attention, .{ q, k, v, token_index, .vanilla });
+    const vanilla_h: zml.Slice = try vanilla_d.toSliceAlloc(allocator, io);
+    defer vanilla_h.free(allocator);
+
+    for (std.enums.values(Backend)) |backend| {
+        switch (backend) {
+            .attnd, .vanilla => continue,
+            else => if (!backend.isAvailable(platform)) continue,
+        }
+
+        const metadata: Metadata = .init(.fromBackend(backend, 64, 8));
+        const parameters: Parameters = .init(.fromBackend(backend));
+        const exe = try platform.compileFn(
+            allocator,
+            io,
+            attention,
+            .{ tensors.q, tensors.k, tensors.v, tensors.token_index, metadata, parameters },
+            .{ .program_name = try std.fmt.allocPrint(arena, "attention_{t}", .{backend}) },
+        );
+        defer exe.deinit();
+
+        var metadata_d = try metadata.initBuffer(io, platform, .replicated);
+        defer Metadata.deinitBuffer(&metadata_d);
+
+        const output_d = try zml.testing.autoCall(allocator, io, &exe, attention, .{ q, k, v, token_index, metadata_d });
+        try zml.testing.expectClose(io, vanilla_h, output_d, .{
+            .absolute_tolerance = 1e-3,
+            .relative_tolerance = 1e-2,
+            .epsilon_relative = 1e-6,
+        });
+    }
 }
