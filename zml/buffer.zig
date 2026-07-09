@@ -312,17 +312,28 @@ pub const Buffer = struct {
     }
 };
 
+pub const Error = error{ MissingLogicalBinding, IncompatibleSharding };
+
 fn placementOrPanic(sharding: Sharding, shape: Shape) Sharding.Placement {
     return sharding.placement(shape) catch |err| {
         @branchHint(.cold);
         switch (err) {
-            error.UnitializedOptions => {
+            error.MissingLogicalBinding => {
                 log.err(
                     \\Failed to shard Buffer of shape {f}, with sharding:
                     \\{f}
                     \\
                     \\The Buffer is probably inheriting a partitionned shape from a Tensor,
                     \\So Buffer creation must pass a Sharding, that maps the logical sharding of the Tensor to the physical mesh.
+                , .{ shape, sharding });
+                @panic("Failed to compute placement");
+            },
+            error.IncompatibleSharding => {
+                log.err(
+                    \\Failed to shard Buffer of shape {f}, with sharding:
+                    \\{f}
+                    \\
+                    \\The Buffer dimension isn't properly divisible by the number of devices along the sharded axis.
                 , .{ shape, sharding });
                 @panic("Failed to compute placement");
             },
