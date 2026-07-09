@@ -14,9 +14,16 @@ var _platform: ?*const Platform = null;
 pub fn env() *const Platform {
     if (!builtin.is_test) @compileError("Cannot use zml.testing.env outside of a test block");
     if (_platform == null) {
-        _platform = Platform.auto(std.heap.c_allocator, std.testing.io, .{
-            .xla_gpu = .{ .allocator = .{ .bfc = .{ .preallocate = true, .memory_fraction = 0.85 } } },
-        }) catch unreachable;
+        const platform = Platform.auto(
+            std.heap.c_allocator,
+            std.testing.io,
+            .{
+                .xla_gpu = .{ .allocator = .{ .bfc = .{ .preallocate = true, .memory_fraction = 0.85 } } },
+            },
+        ) catch @panic("Pjrt not available");
+
+        _ = platform.registerSharding("model", .mesh(.{ .model = .high_bandwidth })) catch @panic("failed to register sharding");
+        _platform = platform;
     }
 
     return _platform.?;

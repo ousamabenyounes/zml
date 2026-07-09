@@ -189,10 +189,8 @@ test attention {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const platform = try zml.Platform.auto(allocator, io, .{});
-    defer platform.deinit(allocator, io);
-    const model_sharding = try platform.registerSharding("model", .mesh(.{ .model = .high_bandwidth }));
-    const shardings: [1]zml.Sharding = .{model_sharding};
+    const platform = zml.testing.env();
+    const shardings = platform.shardings.values();
 
     // No batchsize because of fa2
     // TODO: fix fa2 bindings
@@ -215,7 +213,7 @@ test attention {
 
     const vanilla_exe = try platform.compileFn(allocator, io, attention, .{ tensors.q, tensors.k, tensors.v, tensors.token_index, .vanilla, .vanilla }, .{
         .program_name = "attention_vanilla",
-        .shardings = &shardings,
+        .shardings = shardings,
     });
     defer vanilla_exe.deinit();
 
@@ -239,12 +237,12 @@ test attention {
             .{ tensors.q, tensors.k, tensors.v, tensors.token_index, metadata, parameters },
             .{
                 .program_name = try std.fmt.allocPrint(arena, "attention_{t}", .{backend}),
-                .shardings = &shardings,
+                .shardings = shardings,
             },
         );
         defer exe.deinit();
 
-        var metadata_d = try metadata.initBuffer(io, platform, shardings[0]);
+        var metadata_d = try metadata.initBuffer(io, platform, platform.shardings.get("model").?);
         defer Metadata.deinitBuffer(&metadata_d);
 
         var output_d = try zml.testing.autoCall(allocator, io, &exe, attention, .{ q, k, v, token_index, metadata_d });
