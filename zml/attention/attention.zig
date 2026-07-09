@@ -183,17 +183,23 @@ pub fn attention(q: zml.Tensor, k: zml.Tensor, v: zml.Tensor, token_index: zml.T
 }
 
 test attention {
-    const platform = zml.testing.env();
     const io = std.testing.io;
     const allocator = std.testing.allocator;
     var arena_state: std.heap.ArenaAllocator = .init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
+    const platform = try zml.Platform.auto(allocator, io, .{});
+    defer platform.deinit(allocator, io);
+    const model_sharding = try platform.registerSharding("model", .mesh(.{ .model = .high_bandwidth }));
+    const shardings: [1]zml.Sharding = .{model_sharding};
+
+    // No batchsize because of fa2
+    // TODO: fix fa2 bindings
     const tensors: struct { q: zml.Tensor, k: zml.Tensor, v: zml.Tensor, token_index: zml.Tensor } = .{
-        .q = .init(.{ .b = 8, .h = 8, .q = 8, .hd = 32 }, .f32),
-        .k = .init(.{ .b = 8, .h = 2, .k = 64, .hd = 32 }, .f32),
-        .v = .init(.{ .b = 8, .h = 2, .k = 64, .hd = 32 }, .f32),
+        .q = .init(.{ .q = 8, .h = 8, .hd = 32 }, .bf16),
+        .k = .init(.{ .k = 64, .h = 2, .hd = 32 }, .bf16),
+        .v = .init(.{ .k = 64, .h = 2, .hd = 32 }, .bf16),
         .token_index = .init(.{}, .u32),
     };
 
@@ -207,10 +213,14 @@ test attention {
     const v = try zml.testing.autoCall(allocator, io, &rng_k, zml.Tensor.Rng.normal, {});
     const token_index = try zml.Buffer.scalar(io, platform, 64, .u32);
 
-    const vanilla_exe = try platform.compileFn(allocator, io, attention, .{ tensors.q, tensors.k, tensors.v, tensors.token_index, .vanilla, .vanilla }, .{ .program_name = "attention_vanilla" });
+    const vanilla_exe = try platform.compileFn(allocator, io, attention, .{ tensors.q, tensors.k, tensors.v, tensors.token_index, .vanilla, .vanilla }, .{
+        .program_name = "attention_vanilla",
+        .shardings = &shardings,
+    });
     defer vanilla_exe.deinit();
 
     const vanilla_d = try zml.testing.autoCall(allocator, io, &vanilla_exe, attention, .{ q, k, v, token_index, .vanilla });
+    try vanilla_d.await(io);
     const vanilla_h: zml.Slice = try vanilla_d.toSliceAlloc(allocator, io);
     defer vanilla_h.free(allocator);
 
@@ -227,15 +237,28 @@ test attention {
             io,
             attention,
             .{ tensors.q, tensors.k, tensors.v, tensors.token_index, metadata, parameters },
-            .{ .program_name = try std.fmt.allocPrint(arena, "attention_{t}", .{backend}) },
+            .{
+                .program_name = try std.fmt.allocPrint(arena, "attention_{t}", .{backend}),
+                .shardings = &shardings,
+            },
         );
         defer exe.deinit();
 
-        var metadata_d = try metadata.initBuffer(io, platform, .replicated);
+        var metadata_d = try metadata.initBuffer(io, platform, shardings[0]);
         defer Metadata.deinitBuffer(&metadata_d);
 
-        const output_d = try zml.testing.autoCall(allocator, io, &exe, attention, .{ q, k, v, token_index, metadata_d });
-        try zml.testing.expectClose(io, vanilla_h, output_d, .{
+        var output_d = try zml.testing.autoCall(allocator, io, &exe, attention, .{ q, k, v, token_index, metadata_d });
+        defer output_d.deinit();
+        try output_d.await(io);
+        const output_h = try output_d.toSliceAlloc(allocator, io);
+        defer output_h.free(allocator);
+
+        errdefer std.log.err(
+            \\ Attention test failed, {0t} output doesn't match reference.
+            \\ - reference: {1d}
+            \\ - {0t}: {2d}
+        , .{ backend, vanilla_h, output_h });
+        try zml.testing.expectClose(io, vanilla_h, output_h, .{
             .absolute_tolerance = 1e-3,
             .relative_tolerance = 1e-2,
             .epsilon_relative = 1e-6,
